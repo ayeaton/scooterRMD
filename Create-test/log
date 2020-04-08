@@ -1,0 +1,16 @@
+
+
+========== filter data matrix ========== 
+
+
+                     unfiltered min genes: 1
+                     unfiltered max genes: 250
+                     unfiltered mean num genes: 66.715
+                     unfiltered median num genes: 65
+min genes cutoff: 50
+max genes cutoff: 6000
+max mitochondrial percentage cutoff: 15
+imported cells: 200
+imported genes: 462
+filtered cells: 137
+filtered genes: 462

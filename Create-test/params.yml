@@ -1,0 +1,27 @@
+data_path: ~/aifantislab/scooterRMD/data
+out_path: '.'
+sample_name: test
+hashtag_ID: ~
+hashtags_to_keep: ~
+hashtag_file: ~
+ADT_file: ~
+sample_names: ~
+ADT: no
+assay: RNA
+grouping: orig.ident
+hash_grouping: hash.ID
+min_genes: 50
+max_genes: 6000
+max_mt: 15
+normalize_method: log_norm
+nfeatures: 2000
+num_pcs: 30
+num_dim:
+- 20
+- 25
+num_neighbors:
+- 20
+- 10
+prefix: lognorm
+log_file: log
+clean: yes

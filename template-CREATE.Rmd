@@ -10,9 +10,9 @@ output:
     toc: yes
     df_print: paged
 params:
-  data_path: "" # path to the directory with the outs file
+  data_path: "./scooterRMD/data" # path to the directory with the outs file
   out_path: "." # output path where the outputs will be stored
-  sample_name: ""   # name of the current sample 
+  sample_name: "test"   # name of the current sample 
   hashtag_ID: NULL # names of the hashtags (if the hashtags are NOT separate from the gene expression data)
   hashtags_to_keep: NULL # names of the hashtags to keep (if the hashtags are NOT separate from the gene expression data)
   hashtag_file: NULL # path to hashtag file (if it is separate from the gene expression data)
@@ -24,7 +24,7 @@ params:
   assay: "RNA"   # Assay we are working with
   grouping: "orig.ident" # grouping for plots
   hash_grouping: "hash.ID" # grouping for plots hashtags but doesnt work with anythin else right now
-  min_genes: 400 # minimum number of genes per cell
+  min_genes: 50 # minimum number of genes per cell
   max_genes: 6000 # maximum number of genes per cell 
   max_mt: 15  # maximum percent mitochondrial reads per cell 
   normalize_method: "log_norm" # normalization method. One of log_norm or sct
@@ -34,6 +34,7 @@ params:
   num_neighbors: [20, 10] # number of neighbors to use in UMAP
   prefix: "lognorm"   # prefix to add to UMAP. Useful if you are doing different normalizations, or using different subsets of the data
   log_file: "log" # log file
+  clean: TRUE # remove all files that clutter the output folder. potentially dangerous 
 ---
 
 ```{r setup, include=FALSE}
@@ -47,15 +48,20 @@ knitr::opts_chunk$set(echo = FALSE,
                       dev = c("png", "pdf"))
 ```
 
-```{r load_libraries}
+# Preprocessing single cell RNA sequencing data
+
+This markdown file contains the code to download and preprocess single cell RNA sequencing data mostly using Seurat. 
+
+```{r load_libraries, message=FALSE, warning=FALSE, include=FALSE}
 library(future)
 library(cowplot)
-library(devtools)
 library(forcats)
 library(GGally)
 library(stringr)
 library(ggpmisc)
 library(ggrepel)
+
+library(devtools)
 load_all("/gpfs/home/ay1392/tsirigoslabdir/scooter") # PATH TO SCOOTER
 theme_set(theme_bw())
 
@@ -63,11 +69,11 @@ theme_set(theme_bw())
 plan("multiprocess", workers = 4)
 # # increase the limit of the data to be shuttled between the processes from default 500MB to 50GB
 options(future.globals.maxSize = 30 * 1024 ^ 3)
-
 ```
 
-```{r process_params}
-# Create a new directory for this sample. Error is that directory already exists
+
+```{r process_params, message=FALSE, warning=FALSE, include=FALSE}
+# Create a new directory for this sample. Errors when that directory already exists
 out_path = file.path(out_path, paste0("Create-", sample_name, "/"))
 
 if (dir.exists(out_path)) {
@@ -76,13 +82,14 @@ if (dir.exists(out_path)) {
   dir.create(out_path)
 }
 
+# create parameters yaml file and a log file
 yaml::write_yaml(params, glue("{out_path}/params.yml"))
 log_file = file.path(out_path, "log")
 ```
 
-## Create RMD
+# Create RMD
 
-The output of this file is a directory called `r paste0("Create-", sample_name)` within which there will be a params.yml that saves the parameters from this file, and a log file. 
+The output of this file is a directory called `r paste0("Create-", sample_name)` within which there will be a params.yml that saves the parameters from this file, and a log file if you specified a file name above. 
 
 If you choose to use the cache = TRUE parameter, rendering this file may be quicker the second time around, but please be aware that when you run the file a second time, the cached code chunk will not run again unless you change something *within* the code chunk. So, if you make changes *upstream* of the cached code chunk, the cached code chunk will not take that into account and output the cached result. 
 
@@ -90,15 +97,20 @@ If you choose to use the cache = TRUE parameter, rendering this file may be quic
 
 ```{r preprocessing, warning=FALSE, results='asis'}
 if (dir.exists(data_path)) {
-    cat(paste(c("", sprintf("`%s`", list.files(paste(data_path, "/outs"), full.names = TRUE))),
-              collapse = "\n- "))
+    message_str <- paste(c("", sprintf("`%s`", list.files(paste(data_path, "/outs"), 
+                                               full.names = TRUE))),
+              collapse = "\n- ")
+    write_message(message_str, log_file)
 } else { # hd5 file
-    cat(paste("Input file:", sprintf("`%s`", data_path), ".\n"))
+    message_str <- paste("Input file:", sprintf("`%s`", data_path), ".\n")
+    write_message(message_str, log_file)
 }
-cat("\n\n")
 ```
 
-Read in data and parse the data types. 
+Curently, features, i.e genes, hashtags, and CITE-Seq antibodies, are labelled as "Gene Expression" or "Antibody Capture". We collect all of the data corresponding to Gene Expression and put it in one matrix, and all of the data corresponding to Antibody Capture, and put it in another matrix. We then store these two matrices in the list `counts_mat`. 
+
+We select the "Gene Expression" matrix from  our list `counts_mat` and use it to create a Seurat object. Seurat objects are data containers with a specific structure.
+
 ```{r read_in_data}
 # load counts to a list of matrices
 counts_mat <- load_sample_counts_matrix(path = data_path,
@@ -108,13 +120,18 @@ counts_mat <- load_sample_counts_matrix(path = data_path,
 seurat_obj <- create_seurat_obj(counts_matrix = counts_mat[["Gene Expression"]],
                                 assay = "RNA",
                                 log_file = NULL) 
+```
 
+Some experiments use hashtags to multiplex the data. If `hashtag_ID`s were specified in the parameter section, these hashtag IDs will be subset from the "Antibody Capture" matrix and processed as hashtags. ADT data (the data in the "Antibody Capture" matrix that is not a hashtag) will also be processed if `ADT` is set to TRUE. 
+
+```{r hashtag_IDs, include=FALSE}
 # if there are hashtag_IDs specified then subset from the Antibody capture matrix 
 # the specified hashtag_IDs and add them as an HTO assay 
 if(!is.null(hashtag_ID)) {
   
   # get the specified hashtags that are found in the rownames of the antibody capture matrix
-  interect_hash <- intersect(hashtag_ID, rownames(counts_mat[["Antibody Capture"]]))
+  interect_hash <- intersect(hashtag_ID,
+                             rownames(counts_mat[["Antibody Capture"]]))
   
   # if the length of the specified hashtags and the specified hashtags found in the 
   # rownames of the antibody capture matrix are different, we have a problem
@@ -140,19 +157,22 @@ if(!is.null(hashtag_ID)) {
     stop(glue("Need to fix hashtag_IDs to match what Seurat changes them to. Seurat replaces underscores with dashes"))
   }
 
-  
   # normalize the hashtag counts using centered log ratio transformation to normalize the hashtags
   seurat_obj <- NormalizeData(seurat_obj, assay = "HTO", normalization.method = "CLR")
   
   # if there are ADTs within the 10x 
   if(ADT) {
     
+    # ADTs are assumed to be everything in the Antibody Capture matrix that isnt a hashtag
     ADT_counts <- counts_mat[["Antibody Capture"]][-hash_idx, ]
     
+    # The ADT data is usually messy if you did not run the 10x run yourself
+    # This is an attempt to clean the ADT data. 
     ADT_names <- apply(as.data.frame(rownames(ADT_counts)) ,1, function(x) str_split(x, "-")[[1]][1]) %>% 
       as.data.frame() %>% 
       mutate(ADT = toupper(.)) %>% 
-      mutate(ADT = ifelse(str_detect(ADT,"MOUSE") | str_detect(ADT,"ARMENIAN",)| str_detect(ADT, "RAT"),str_replace_all(ADT, "_", "") , ADT)) %>% 
+      mutate(ADT = ifelse(str_detect(ADT,"MOUSE") | str_detect(ADT,"ARMENIAN",)| str_detect(ADT, "RAT"), 
+                          str_replace_all(ADT, "_", "") , ADT)) %>% 
       separate(ADT, c("ADT", NA), sep = "_")
     
     rownames(ADT_counts) <- ADT_names$ADT
@@ -163,11 +183,14 @@ if(!is.null(hashtag_ID)) {
                                    counts_matrix = ADT_counts)
     
     # normalize the hashtag counts using centered log ratio transformation to normalize the hashtags
-    seurat_obj <- NormalizeData(seurat_obj, assay = "ADT", normalization.method = "CLR")
+    seurat_obj <- NormalizeData(seurat_obj, assay = "ADT",
+                                normalization.method = "CLR")
   }
 }
+```
 
-# if there is a hashtag file 
+```{r hashtag_legacy, include=FALSE}
+# if there is a file with the hashtag data (older 10x)
 if(!is.null(hashtag_file)) {
   hto_counts <- load_sample_counts_matrix(path = hashtag_file, 
                             sample_name = sample_name)
@@ -176,10 +199,13 @@ if(!is.null(hashtag_file)) {
                                  assay = "HTO",
                                  counts_matrix = hto_counts[["Antibody Capture"]])
   
-  seurat_obj <- NormalizeData(seurat_obj, assay = "HTO", normalization.method = "CLR")
+  seurat_obj <- NormalizeData(seurat_obj, assay = "HTO",
+                              normalization.method = "CLR")
   
 }
+```
 
+```{r ADT_legacy, include=FALSE}
 #if there is an ADT_file
 if(!is.null(ADT_file)) {
   
@@ -206,14 +232,117 @@ if(!is.null(ADT_file)) {
 ```
 
 ```{r save_rds_raw}
-# save final Seurat object
+# save Seurat object
 saveRDS(seurat_obj, file = paste0(out_path, "/", "seurat_obj_raw.rds"))
 ```
-The seurat object  was saved as `r paste0(out_path, "/", "seurat_obj_raw.rds")`
 
+The seurat object (no filtering) was saved as `r paste0(out_path, "seurat_obj_raw.rds")`
 
+# Demultiplex data 
 
-Plot distribution of the number of genes, UMI, and percent mitochondrial reads per cell. 
+If this experiment uses hashtags, the cells will be demultiplexed, and hashtag data will be plotted. Cells that are labeled "Singlets" or "Doublets" are removed. If `hashtags_t_keep` was set, only these selected hashtags will be used downstream: `r hashtags_to_keep`. Thereis also the opportunity to rename the  hashtags to cleaner sample names using the list `sample_names` set above.
+
+```{r demultiplex_hashtags}
+# If hashtag_IDs are specified
+if(!is.null(hashtag_ID) | !is.null(hashtag_file)) {
+
+  hashtag_ID = rownames(seurat_obj@assays$HTO)
+  # Demultiplex the hashtags using HTODemux. If HTODemux is troublesome, there is a
+  # another function MUTLIseqDEMUX() that also works
+  seurat_obj <- HTODemux(seurat_obj, assay = "HTO", positive.quantile = 0.99)
+
+  # Set the identity of the seurat object to the hash grouping and plot
+  Idents(seurat_obj) <- hash_grouping
+  print(RidgePlot(seurat_obj, assay = "HTO",
+            features = rownames(seurat_obj[["HTO"]]),
+            ncol = 2, cols = ggsci::pal_igv()(length(hashtag_ID) + 2)))
+
+  # Add scatterplots
+  hto_data <- as_data_frame_seurat(seurat_obj,
+                       assay = "HTO",
+                       slot = "data",
+                       features = hashtag_ID)
+  
+  print(ggpairs(hto_data, columns = hashtag_ID,
+          ggplot2::aes(colour = hash.ID),
+    upper= list(continuous = function(data, mapping, ...) {
+         ggally_cor(data = data, mapping = mapping, size = 3) + ggsci::scale_color_igv()}),
+    lower = list(continuous = function(data, mapping, ...) {
+         ggally_points(data = data, mapping = mapping, alpha = .2) + ggsci::scale_color_igv()}),
+    diag = list(continuous = function(data, mapping, ...) {
+         ggally_densityDiag(data = data, mapping = mapping, alpha = .5) + ggsci::scale_fill_igv()})))
+  
+  # percent neg and doublet
+  neg_doublet <- hto_data %>% 
+    select(hash.ID) %>% 
+    group_by(hash.ID) %>% 
+    summarise(n = n()) %>% 
+    mutate(pct = n/sum(n)) %>% 
+    mutate(hash.ID = factor(x = hash.ID, levels = hash.ID[order(pct, decreasing = T)]))
+  
+  print(ggplot(neg_doublet) +
+    geom_bar(aes(y = pct, x = hash.ID, fill = hash.ID),
+                           stat="identity", position = "dodge") + 
+    ggsci::scale_fill_igv() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 12)))
+
+  
+  # subset everything that isn't a singlet
+  seurat_obj <- subset(seurat_obj,
+                       cells = WhichCells(seurat_obj,
+                                          idents = c("Negative", "Doublet"),
+                                          invert = TRUE))
+}
+```
+
+```{r subset_hashtags}
+if(!is.null(hashtags_to_keep)) {
+  Idents(seurat_obj) <- hash_grouping
+  seurat_obj <- subset(seurat_obj,
+                       cells = WhichCells(seurat_obj,
+                                          idents = hashtags_to_keep))
+  
+  # Add scatterplots
+  hto_data <- as_data_frame_seurat(seurat_obj,
+                       assay = "HTO",
+                       slot = "data",
+                       features = hashtag_ID)
+  
+  ggpairs(hto_data, columns = hashtag_ID,
+          ggplot2::aes(colour = hash.ID),
+    upper= list(continuous = function(data, mapping, ...) {
+         ggally_cor(data = data, mapping = mapping, size = 3) + ggsci::scale_color_igv()}),
+    lower = list(continuous = function(data, mapping, ...) {
+         ggally_points(data = data, mapping = mapping, alpha = .2) + ggsci::scale_color_igv()}),
+    diag = list(continuous = function(data, mapping, ...) {
+         ggally_densityDiag(data = data, mapping = mapping, alpha = .5) + ggsci::scale_fill_igv()}))
+  
+}
+```
+
+```{r clean_hto_names}
+# rename the hashtags/samples
+if((!is.null(hashtag_ID) | !is.null(hashtag_file)) & length(sample_names) > 0) {
+  
+  metadata <- seurat_obj@meta.data %>% 
+    mutate(samples = hash.ID) 
+  
+  for(i in 1:length(sample_names)) {
+    metadata <- metadata %>% 
+      mutate(samples = ifelse(hash.ID == names(sample_names)[i], sample_names[i][[1]], samples))
+  }
+  
+  
+  seurat_obj@meta.data$samples <- metadata$samples
+}
+```
+
+# Quality control
+
+We use the number of unique molecular counts (UMIs), number of expressed genes, and the percent of counts that are from mitochondrial RNA to filter low quality cells. A cell with few UMIs and number of expressed genes but high percent of mitochondrial counts indicates that the  cell might be sheared, causing the cytoplasm to leak out of the cell leaving only the protected mRNA in the mitochondria. On the other hand, cells with high number of UMIs and high number of genes expressed may indicate a doublet.
+
+To vizualize the quality of the cells, we plot violin plots of the number of genes, number of UMIs, and percent mitochondrial reads per cell. 
+
 ```{r unfiltered_violin_qc}
 # plot number of genes 
 genes_unfilt <- plot_distribution(seurat_obj, 
@@ -269,157 +398,6 @@ plot_grid(title,
           rel_heights = c(0.1, 1))
 ```
 
-
-Demultiplex hashtags and plot QC plots.
-```{r demultiplex_hashtags}
-# If hashtag_IDs are specified
-if(!is.null(hashtag_ID) | !is.null(hashtag_file)) {
-
-  hashtag_ID = rownames(seurat_obj@assays$HTO)
-  # Demultiplex the hashtags using HTODemux. If HTODemux is troublesome, there is a
-  # another function MUTLIseqDEMUX() that also works
-  seurat_obj <- HTODemux(seurat_obj, assay = "HTO", positive.quantile = 0.99)
-
-  # Set the identity of the seurat object to the hash grouping and plot
-  Idents(seurat_obj) <- hash_grouping
-  print(RidgePlot(seurat_obj, assay = "HTO",
-            features = rownames(seurat_obj[["HTO"]]),
-            ncol = 2, cols = ggsci::pal_igv()(length(hashtag_ID) + 2)))
-
-  # Add scatterplots
-  hto_data <- as_data_frame_seurat(seurat_obj,
-                       assay = "HTO",
-                       slot = "data",
-                       features = hashtag_ID)
-  
-  print(ggpairs(hto_data, columns = hashtag_ID,
-          ggplot2::aes(colour = hash.ID),
-    upper= list(continuous = function(data, mapping, ...) {
-         ggally_cor(data = data, mapping = mapping, size = 3) + ggsci::scale_color_igv()}),
-    lower = list(continuous = function(data, mapping, ...) {
-         ggally_points(data = data, mapping = mapping, alpha = .2) + ggsci::scale_color_igv()}),
-    diag = list(continuous = function(data, mapping, ...) {
-         ggally_densityDiag(data = data, mapping = mapping, alpha = .5) + ggsci::scale_fill_igv()})))
-  
-  # percent neg and doublet
-  neg_doublet <- hto_data %>% 
-    select(hash.ID) %>% 
-    group_by(hash.ID) %>% 
-    summarise(n = n()) %>% 
-    mutate(pct = n/sum(n)) %>% 
-    mutate(hash.ID = factor(x = hash.ID, levels = hash.ID[order(pct, decreasing = T)]))
-  
-  print(ggplot(neg_doublet) +
-    geom_bar(aes(y = pct, x = hash.ID, fill = hash.ID),
-                           stat="identity", position = "dodge") + 
-    ggsci::scale_fill_igv() +
-    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 12)))
-
-  
-  # subset everything that isn't a singlet
-  seurat_obj <- subset(seurat_obj,
-                       cells = WhichCells(seurat_obj,
-                                          idents = c("Negative", "Doublet"),
-                                          invert = TRUE))
-}
-```
-
-Subset hashtags to `r hashtags_to_keep`
-```{r subset_hashtags}
-if(!is.null(hashtags_to_keep)) {
-  seurat_obj <- subset(seurat_obj,
-                       cells = WhichCells(seurat_obj,
-                                          idents = hashtags_to_keep))
-  
-   # Add scatterplots
-  hto_data <- as_data_frame_seurat(seurat_obj,
-                       assay = "HTO",
-                       slot = "data",
-                       features = hashtag_ID)
-  
-  ggpairs(hto_data, columns = hashtag_ID,
-          ggplot2::aes(colour = hash.ID),
-    upper= list(continuous = function(data, mapping, ...) {
-         ggally_cor(data = data, mapping = mapping, size = 3) + ggsci::scale_color_igv()}),
-    lower = list(continuous = function(data, mapping, ...) {
-         ggally_points(data = data, mapping = mapping, alpha = .2) + ggsci::scale_color_igv()}),
-    diag = list(continuous = function(data, mapping, ...) {
-         ggally_densityDiag(data = data, mapping = mapping, alpha = .5) + ggsci::scale_fill_igv()}))
-  
-}
-```
-
-```{r clean_hto_names}
-metadata <- seurat_obj@meta.data %>% 
-  mutate(samples = hash.ID) 
-
-for(i in 1:length(sample_names)) {
-  metadata <- metadata %>% 
-    mutate(samples = ifelse(hash.ID == names(sample_names)[i], sample_names[i][[1]], samples))
-}
-
-
-seurat_obj@meta.data$samples <- metadata$samples
-```
-
-
-```{r unfiltered_singlet_violin_qc}
-if(!is.null(hashtag_ID)) {
-
-  # plot number of genes
-  genes_sing <- plot_distribution(seurat_obj, 
-                                features = "nFeature_RNA", 
-                                grouping = grouping) +
-  geom_hline(yintercept=min_genes, color = "red", size = 2) +
-  geom_hline(yintercept=max_genes, color = "red", size = 2) +
-  annotate(geom="text", x=0.7, y=max_genes - 200, label= glue("Max genes: {max_genes}"),
-              color="red") +
-  annotate(geom="text", x=0.7, y=min_genes - 200, label=glue("Min genes: {min_genes}"),
-              color="red")
-
-  # plot number of UMIs
-  umi_sing <- plot_distribution(seurat_obj,
-                                features = "nCount_RNA",
-                                grouping = grouping)
-
-  # plot percent mitochondrial reads
-  mito_sing <- plot_distribution(seurat_obj, 
-                               features = "pct_mito",
-                               grouping = grouping) +
-  geom_hline(yintercept=max_mt, color = "red", size = 2) +
-  annotate(geom="text", x=0.7, y=max_mt + 5, label=glue("Max pct mito: {max_mt}"),
-              color="red")
-
-  # get the legend for one of the plots to use as legend for the combined plot
-  legend_grid <- get_legend(mito_sing)
-
-  # Combine plots
-  plot_row <- plot_grid(genes_sing + theme(legend.position = "none"),
-            umi_sing + theme(legend.position = "none"),
-            mito_sing + theme(legend.position = "none"),
-            legend_grid,
-            ncol = 4)
-  
-  title <- ggdraw() + 
-  draw_label(
-    "Unfiltered-data-singlets",
-    fontface = 'bold',
-    x = 0,
-    hjust = 0
-  ) +
-  theme(
-    # add margin on the left of the drawing canvas,
-    # so title is aligned with left edge of first plot
-    plot.margin = margin(0, 0, 0, 7)
-  )
-
-    plot_grid(title,
-            plot_row,
-            ncol = 1,
-            rel_heights = c(0.1, 1))
-}
-```
-
 ```{r unfiltered_singlet_hash_qc}
 if(!is.null(hashtag_ID)) {
   # plot number of genes
@@ -458,7 +436,7 @@ if(!is.null(hashtag_ID)) {
   
   title <- ggdraw() + 
   draw_label(
-    "Unfiltered-data-singlet-hashtags",
+    "Unfiltered-data-demultiplexed",
     fontface = 'bold',
     x = 0,
     hjust = 0
@@ -476,15 +454,44 @@ if(!is.null(hashtag_ID)) {
 }
 ```
 
-Filter the data.
-```{r filter}
-# filter data
-seurat_obj <- filter_data(seurat_obj, min_genes = min_genes,
-                          max_genes = max_genes, max_mt = max_mt,
-                          log_file = log_file)
+The violin plots are great for getting an idea about what is going on for each of these variables on their own. Now we take a look at the relationship between these variables. 
+
+We plot the number of UMIs, the number of genes, and the percent mitochondria against each other. This is one way we can start to see if higher mitochondrial percentage is biological or technical. 
+
+```{r unfiltered_paired_qc}
+
+meta_qc <- as_data_frame_seurat(seurat_obj)
+
+print(ggpairs(meta_qc, columns = c("nFeature_RNA",
+                                   "nCount_RNA",
+                                   "pct_mito"),
+    upper= list(continuous = function(data, mapping, ...) {
+         ggally_cor(data = data, mapping = mapping, size = 3)}),
+    lower = list(continuous = function(data, mapping, ...) {
+         ggally_points(data = data, mapping = mapping, alpha = .2) }),
+    diag = list(continuous = function(data, mapping, ...) {
+         ggally_densityDiag(data = data, mapping = mapping, alpha = .5) })))
 ```
 
-```{r freq_mean}
+We also plot the number of expressed genes per cell in relation to the the total number of aggregated counts per cell. This plot sheds light on the spread of the counts per cell. Are there few genes that have many counts? Are there many genes that have few counts?
+
+```{r cell-activity}
+# number of genes with non-zero counts 
+num_genes <- apply(as.data.frame(seurat_obj@assays$RNA@counts), 2, function(x) (sum(x != 0)))
+
+# number of total genes
+libsize <- colSums(as.data.frame(seurat_obj@assays$RNA@counts))
+
+ggplot(data = as.data.frame(cbind(num_genes, libsize)),
+       aes(x = log10(libsize), y = num_genes)) +
+  geom_point(size = 3, alpha = 0.6) +
+  xlab("Library Size (log10)") +
+  ylab("Number of Expressed Genes") 
+```
+
+We are also curious about the quality of each gene. By plotting the percent of cells that express a certain gene against the mean of that gene we can see whether a gene is expressed in many cells or in few cells. 
+
+```{r freq-mean-gene}
 # for each gene, calculate % of cells expressing it and the mean
 pct_cells <- apply(as.data.frame(seurat_obj@assays$RNA@counts), 1, function(x) (sum(x != 0))) / ncol(seurat_obj@assays$RNA@counts)
 
@@ -492,6 +499,7 @@ gene_means <- rowMeans(as.data.frame(seurat_obj@assays$RNA@counts))
 
 p <- as.data.frame(cbind(pct_cells, gene_means)) %>% 
   rownames_to_column("gene")
+
 ggplot(data = p, aes(x = gene_means, y = pct_cells, label = gene)) +
   geom_point(size = 3, alpha = 0.6) +
   xlab("Mean count per gene") +
@@ -499,20 +507,19 @@ ggplot(data = p, aes(x = gene_means, y = pct_cells, label = gene)) +
   stat_dens2d_labels(geom = "text_repel", keep.fraction = 0.001)
 ```
 
-```{r cell-activity}
-# number of expressed genes
-num_genes <- apply(as.data.frame(seurat_obj@assays$RNA@counts), 2, function(x) (sum(x != 0)))
+# Filtering
 
-libsize <- colSums(as.data.frame(seurat_obj@assays$RNA@counts))
+We filter the data using the hard cutoffs set in the parameters for minimum and maximum number of genes a cell may express, as well as the maximum mitochondrial percentage a cell can express. 
+If the thresholds are not provided, cells with the most number of genes expressed (98%) and the least number of genes expressed (2%), and cells with greater that 10% mitochondrial counts will be removed. 
 
-l  <- as.data.frame(cbind(num_genes, libsize)) 
+We re-plot the QC plots.
 
-ggplot(data = l, aes(x = log10(libsize), y = num_genes)) +
-  geom_point(size = 3, alpha = 0.6) +
-  xlab("Library Size (log10)") +
-  ylab("Number of Expressed Genes") 
+```{r filter}
+# filter data
+seurat_obj <- filter_data(seurat_obj, min_genes = min_genes,
+                          max_genes = max_genes, max_mt = max_mt,
+                          log_file = log_file)
 ```
-
 
 ```{r filtered_qc}
 # plot number of genes
@@ -606,6 +613,52 @@ if(!is.null(hashtag_ID)) {
 }
 ```
 
+```{r filtered_paired_qc}
+
+meta_qc <- as_data_frame_seurat(seurat_obj)
+
+print(ggpairs(meta_qc, columns = c("nFeature_RNA",
+                                   "nCount_RNA",
+                                   "pct_mito"),
+    upper= list(continuous = function(data, mapping, ...) {
+         ggally_cor(data = data, mapping = mapping, size = 3)}),
+    lower = list(continuous = function(data, mapping, ...) {
+         ggally_points(data = data, mapping = mapping, alpha = .2) }),
+    diag = list(continuous = function(data, mapping, ...) {
+         ggally_densityDiag(data = data, mapping = mapping, alpha = .5) })))
+```
+
+```{r filtered-cell-activity}
+# number of expressed genes
+num_genes <- apply(as.data.frame(seurat_obj@assays$RNA@counts), 2, function(x) (sum(x != 0)))
+
+libsize <- colSums(as.data.frame(seurat_obj@assays$RNA@counts))
+
+l  <- as.data.frame(cbind(num_genes, libsize)) 
+
+ggplot(data = l, aes(x = log10(libsize), y = num_genes)) +
+  geom_point(size = 3, alpha = 0.6) +
+  xlab("Library Size (log10)") +
+  ylab("Number of Expressed Genes") 
+```
+
+```{r filtred-freq_mean}
+# for each gene, calculate % of cells expressing it and the mean
+pct_cells <- apply(as.data.frame(seurat_obj@assays$RNA@counts), 1, function(x) (sum(x != 0))) / ncol(seurat_obj@assays$RNA@counts)
+
+gene_means <- rowMeans(as.data.frame(seurat_obj@assays$RNA@counts))
+
+p <- as.data.frame(cbind(pct_cells, gene_means)) %>% 
+  rownames_to_column("gene")
+ggplot(data = p, aes(x = gene_means, y = pct_cells, label = gene)) +
+  geom_point(size = 3, alpha = 0.6) +
+  xlab("Mean count per gene") +
+  ylab("Percent cells expressing gene") +
+  stat_dens2d_labels(geom = "text_repel", keep.fraction = 0.001)
+```
+
+
+If there are CITE-Seq antibodies, we also plot the percent of cells that express a certain ADT against the mean of that ADT. In this way we can see whether a ADT is expressed in many cells or in few cells. 
 
 ```{r adt_freq_mean}
 if(ADT){
@@ -616,6 +669,7 @@ gene_means <- rowMeans(as.data.frame(seurat_obj@assays$ADT@data))
 
 p <- as.data.frame(cbind(pct_cells, gene_means)) %>% 
   rownames_to_column("ADT")
+
 ggplot(data = p, aes(x = gene_means, y = pct_cells, label = ADT)) +
   geom_point(size = 3, alpha = 0.6) +
   xlab("Mean count per ADT") +
@@ -624,12 +678,19 @@ ggplot(data = p, aes(x = gene_means, y = pct_cells, label = ADT)) +
 }
 ```
 
-Normalize the data using `r normalize_method`
+# Normalizing the data
+
+We normalize the data using `r normalize_method`. The point of normalizing the data is to make the data less skewed.
+
 ```{r Normalize}
 # normalize seurat object using specified method, on specified assay
 seurat_obj <- normalize_data(seurat_obj, method = normalize_method,
                              nfeatures = nfeatures, assay = assay)
 ```
+
+# Dimensionality Reduction
+
+We run PCA using the most variable genes and run UMAP using the PCs calculated by PCA and parameters specified in the parameter section.
 
 ```{r runpca}
 # run PCA on specified assay using the number of PCs specified
@@ -658,7 +719,7 @@ for(i in 1:nrow(possibilities)) {
 }
 ```
 
-Save metadata as a csv to `r glue("{out_path}/metadata_create_{sample_name}.csv")`
+The metadata is saved as a csv to `r glue("{out_path}/metadata_create_{sample_name}.csv")`
 ```{r save_metadata}
 # Export the reductions to Seurat and save dimensionality reduction and
 # metadata as a csv
@@ -670,7 +731,6 @@ metadata <- as_data_frame_seurat(seurat_obj, reduction = reduction_names,
 write_excel_csv(metadata, path = glue("{out_path}/metadata_create_{sample_name}.csv"))
 ```
 
-Plot dimensionality reduction.
 ```{r plotdr}
 # plot the first two PCs, and all of the different UMAPs
 reduction_names <- c(paste0("UMAP", "ndim", possibilities[,1], "nn", possibilities[,2], prefix), paste0("PC", prefix))
@@ -720,9 +780,17 @@ for(i in 1:nrow(plot_dr)){
 }
 ```
 
-Save rds to `r paste0(out_path, "/", "seurat_obj.rds")`
+```{r clean-up, include=FALSE}
+if(clean){
+  rem <- list.files(out_path, pattern = "plotdr", full.names = TRUE)
+  file.remove(rem)
+}
+```
+
+The final seurat object is saved to `r paste0(out_path, "seurat_obj.rds")`
 ```{r save_rds}
 # save final Seurat object
 saveRDS(seurat_obj, file = paste0(out_path, "/", "seurat_obj.rds"))
 ```
+
 
